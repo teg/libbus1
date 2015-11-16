@@ -1,0 +1,117 @@
+Message Ordering
+================
+
+This defines a partial order of multicast messages, and outlines a lockless
+implementation of the partial order as a total order using a single atomic
+counter.
+
+We consider a finite set of peers, which can perform the following two
+operations
+ * queue a single message destined for any subset of peers; and
+ * dequeue a single message instance destined for itself.
+
+When a message is queued, each desination peer will receive exactly one instance
+of the queued message. Two message instances are instances of the same message
+if and only if they are identical copies of the same message sent from the same
+sender in the same queue operation.
+
+Only one message may be queued (and only one message instance dequeued) at a
+time, so both operations naturally impose a partial order on messages.
+
+Respect local queue/dequeue order:
+----------------------------------
+
+ * if message A is queued before message B by a given peer, A' < B' for any
+   message instance A' of A and any message instance B' of B; and
+ * if message instance A is dequeued before message instance B by a given peer,
+   A < B.
+
+This simply ensures that messages sent between two peers are dequeued in the
+same order they are queued.
+
+This still leaves open the order of messages queued by different peers, and in
+particular the order between packet instances of the same message. Without
+further restrictions, different peers may receive instances of the same pair of
+messages in different order. I.e., if two peers queue the messages A and B,
+respectively, one peer could receive A1 < B1 and another B2 < A2, where A1 and
+A2 are instances of A and B1 and B2 are instances of B.
+
+Respect atomicity of queueing:
+------------------------------
+
+ * given message instances A and B, A = B if and only if they are instances of
+   the same message.
+
+Due to this requirement, we will use the term 'message' and 'message instance'
+interchangeable wherever the terms are unambiguous.
+
+Lastly, we want the order to be consistent with external events. I.e., we want
+to avoid situations such as dequeueing message A triggering the queueing of
+message B on one peer, yet some other peer receives B before A. It is not
+sufficient to consider only the local peer, as the peer queueing B may not be
+the same as received A due to some side-channel communication. Moreover, one
+could imagine a peer queueing the message A, then sending a side-channel signal
+triggering another peer to queue the message B, yet a third peer would receive B
+before A.
+
+Respect causality:
+------------------
+
+ * if message A is dequeued before the queueing of message B is started, we have
+   A < B.
+ * if the queueing of message A finishes before the queuing of B is started, we
+   have A < B.
+
+Note that there is no guarantee that a message is ready to be dequeued the
+moment queueing it has completed. One could imagine a scenario where this would
+matter, where a side-channel signal is sent after a message has been queued, yet
+the message is reday to be queued only after the side-channel signal is ready to
+be processed. This is not seen as a problem, as we are not attempting to order
+messages against external events, merely against eachother. Moreover, the
+problem could be trivially (though potentially inefficiently) solved by having
+the receiving peer send a message to itself whenever a side-channel signal was
+received, and only process the side-channel signal once this 'barrier' message
+had been dequeuede again.
+
+Moreover, if a message A is ready to be dequeued by one peer, at a time when B
+is not ready to be dequeued by another, that does not imply that A < B.
+Similarly to the previous example, this could be worked around by 'flushing' the
+second peer with a self-addressed barrier message before checking for B being
+ready. TODO: figure out whether or not this restriction is arbitrary or natural
+(either way I'm pretty sure we want it as otherwise we'll have terrible
+scalability).
+
+TODO: figure out if there are other natural requirements, whether we would like
+to impose them, whether they follow from what we have, or whether we drop them
+for performance reasons (all the more reason to explain them).
+
+Implementation:
+---------------
+
+A global atomic counter is used to assign a sequence number to every message,
+the sequence number determines the total order of message instances. To avoid
+(global) locking, the assignment is done in two steps. A message instance has
+two variables 'seq' and 'seq_lower'. The meaning of 'seq_lower'  is that this
+message is guaranteed to be ordered after any message with a 'seq' smaller or
+equal to 'seq_lower'. The variables are instantiated as follows:
+ * when starting to queue a messag, the 'seq_lower' variable is instantiated
+   with the current value of the global counter, before copying the message into
+   each receiver queue.
+ * after all the messages have been copied, the counter is atomically
+   incremented and the 'seq' variable in each of the message instances are
+   updated with the value of the incremented counter.
+
+The receive queue is sorted according to the following total order: A < B if
+ * 'seq' is not instantiated in A nor in B, and A.seq_lower < B.seq_lower; or
+ * 'seq' is instantiated in B, but not in A, and A.seq_lower < B.seq; or
+ * 'seq' is instantiated in A, bot not in B, and A.seq <= B.seq_lower; or
+ * 'seq' is instantiated in both A and B and A.seq < B.seq.
+
+If the front of the queue (minimal element) has an uninitialized 'seq', the
+queue is considered empty. Otherwise, the message is guaranteed to be a least
+element, and the message may be dequeued.
+
+Note that the queue does not suffer from starvation, as for any message A, any
+message starting to be queued after A has been assigned its 'seq' will always be
+considered strictly greater than A, and will hence never end up 'blocking' A by
+being before it in the queue.
